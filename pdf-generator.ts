@@ -1,8 +1,16 @@
 /**
  * pdf-generator.ts
- * Calls the Railway PDF microservice and returns PDFs as Buffers.
- * Set PDF_SERVICE_URL and PDF_SERVICE_SECRET in .env.local
+ * Calls generate-pdf.py via Python subprocess and returns the PDF as a Buffer.
+ * Place generate-pdf.py at the project root.
  */
+
+import { execFile } from 'child_process'
+import { promisify } from 'util'
+import { readFile, unlink, mkdtemp } from 'fs/promises'
+import { tmpdir } from 'os'
+import path from 'path'
+
+const execFileAsync = promisify(execFile)
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 
@@ -64,55 +72,41 @@ export interface GeneratedPdfs {
 
 // ── Generator ──────────────────────────────────────────────────────────────────
 
-const PDF_SERVICE_URL = process.env.PDF_SERVICE_URL?.replace(/\/$/, '') ?? ''
-const PDF_SERVICE_SECRET = process.env.PDF_SERVICE_SECRET ?? ''
-
-function getHeaders() {
-  const headers: Record<string, string> = { 'Content-Type': 'application/json' }
-  if (PDF_SERVICE_SECRET) headers['Authorization'] = `Bearer ${PDF_SERVICE_SECRET}`
-  return headers
-}
-
-async function fetchPdf(endpoint: string, order: PdfOrder): Promise<Buffer> {
-  const url = `${PDF_SERVICE_URL}${endpoint}`
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: getHeaders(),
-    body: JSON.stringify(order),
-  })
-  if (!res.ok) {
-    const text = await res.text()
-    throw new Error(`PDF service error ${res.status}: ${text}`)
-  }
-  const arrayBuffer = await res.arrayBuffer()
-  return Buffer.from(arrayBuffer)
-}
+const SCRIPT_PATH = path.resolve(process.cwd(), '..', '..', 'generate-pdf.py')
+const PYTHON = process.platform === 'win32' ? 'python' : 'python3'
 
 export async function generatePdfs(
   order: PdfOrder,
   types: ('invoice' | 'manifest')[] = ['invoice', 'manifest']
 ): Promise<GeneratedPdfs> {
-  if (!PDF_SERVICE_URL) {
-    throw new Error('PDF_SERVICE_URL environment variable is not set')
-  }
+  // Write order data to a temp JSON file so Python can read it
+  const tmpDir = await mkdtemp(path.join(tmpdir(), 'collusion-pdf-'))
+  const jsonPath = path.join(tmpDir, 'order.json')
+  const { writeFile } = await import('fs/promises')
+  await writeFile(jsonPath, JSON.stringify(order))
 
   const result: GeneratedPdfs = {}
 
-  // Fetch both in parallel if both requested
-  const tasks: Promise<void>[] = []
+  for (const type of types) {
+    const outPath = path.join(tmpDir, `${order.id.replace(/\//g, '-')}-${type}.pdf`)
 
-  if (types.includes('invoice')) {
-    tasks.push(
-      fetchPdf('/generate/invoice', order).then(buf => { result.invoice = buf })
-    )
+    try {
+      await execFileAsync(PYTHON, [
+        SCRIPT_PATH,
+        type,
+        '--json', jsonPath,
+        '--out-dir', tmpDir,
+      ], { timeout: 30_000 })
+
+      result[type] = await readFile(outPath)
+    } finally {
+      // Clean up individual pdf (ignore errors)
+      unlink(outPath).catch(() => {})
+    }
   }
 
-  if (types.includes('manifest')) {
-    tasks.push(
-      fetchPdf('/generate/manifest', order).then(buf => { result.manifest = buf })
-    )
-  }
+  // Clean up temp dir
+  unlink(jsonPath).catch(() => {})
 
-  await Promise.all(tasks)
   return result
 }
